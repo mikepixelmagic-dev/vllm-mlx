@@ -56,6 +56,7 @@ from .nemotron_tool_parser import NemotronToolParser
 from .qwen_tool_parser import QwenToolParser
 from .xlam_tool_parser import xLAMToolParser
 from .glm47_tool_parser import Glm47ToolParser
+from .gemma4_tool_parser import Gemma4ToolParser
 from .harmony_tool_parser import HarmonyToolParser
 
 __all__ = [
@@ -75,6 +76,7 @@ __all__ = [
     "NemotronToolParser",
     "xLAMToolParser",
     "FunctionaryToolParser",
+    "Gemma4ToolParser",
     "Glm47ToolParser",
     "HarmonyToolParser",
 ]
