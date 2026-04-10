@@ -47,6 +47,7 @@ class BaseThinkingReasoningParser(ReasoningParser):
     def extract_reasoning(
         self,
         model_output: str,
+        implicit_think: bool = False,
     ) -> tuple[str | None, str | None]:
         """
         Extract reasoning from complete output.
@@ -83,7 +84,14 @@ class BaseThinkingReasoningParser(ReasoningParser):
             _, _, reasoning = text.partition(self.start_token)
             return reasoning.strip() or None, None
 
-        # Case 4: No tags at all - pure content
+        # Case 4: No tags at all
+        if implicit_think:
+            # <think> was in the prompt; the model generated reasoning
+            # without ever producing </think>.  Treat entire output as
+            # reasoning so it doesn't appear as a looping answer.
+            return model_output.strip() or None, None
+
+        # No implicit context — treat as pure content
         return None, model_output
 
     def extract_reasoning_streaming(

@@ -39,6 +39,7 @@ class DeepSeekR1ReasoningParser(BaseThinkingReasoningParser):
     def extract_reasoning(
         self,
         model_output: str,
+        implicit_think: bool = False,
     ) -> tuple[str | None, str | None]:
         """
         Extract reasoning from DeepSeek-R1 output.

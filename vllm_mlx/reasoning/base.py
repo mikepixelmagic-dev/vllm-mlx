@@ -60,6 +60,7 @@ class ReasoningParser(ABC):
     def extract_reasoning(
         self,
         model_output: str,
+        implicit_think: bool = False,
     ) -> tuple[str | None, str | None]:
         """
         Extract reasoning content from complete model output.

@@ -98,8 +98,6 @@ from .api.tool_calling import (
 )
 from .api.utils import (
     SPECIAL_TOKENS_PATTERN,
-    StreamingThinkRouter,
-    StreamingToolCallFilter,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,  # noqa: F401
@@ -120,6 +118,11 @@ _default_max_tokens: int = 32768
 _default_timeout: float = 300.0  # Default request timeout in seconds (5 minutes)
 _default_temperature: float | None = None  # Set via --default-temperature
 _default_top_p: float | None = None  # Set via --default-top-p
+_default_top_k: int | None = None  # Set via --default-top-k
+_default_min_p: float | None = None  # Set via --default-min-p
+_default_presence_penalty: float | None = None  # Set via --default-presence-penalty
+_default_frequency_penalty: float | None = None  # Set via --default-frequency-penalty
+_default_repetition_penalty: float | None = None  # Set via --default-repetition-penalty
 
 _FALLBACK_TEMPERATURE = 0.7
 _FALLBACK_TOP_P = 0.9
@@ -141,6 +144,14 @@ def _resolve_top_p(request_value: float | None) -> float:
     if _default_top_p is not None:
         return _default_top_p
     return _FALLBACK_TOP_P
+
+
+
+def _resolve_optional(request_value, default_value):
+    """Resolve optional parameter: request > CLI default > None."""
+    if request_value is not None:
+        return request_value
+    return default_value
 
 
 # Global MCP manager
@@ -1408,6 +1419,25 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
         "top_p": _resolve_top_p(request.top_p),
     }
 
+    # Add sampling parameters if set (request > CLI default)
+    top_k = _resolve_optional(request.top_k, _default_top_k)
+    if top_k is not None:
+        chat_kwargs["top_k"] = top_k
+    min_p = _resolve_optional(request.min_p, _default_min_p)
+    if min_p is not None:
+        chat_kwargs["min_p"] = min_p
+
+    # Add penalty parameters if set (request > CLI default)
+    presence_penalty = _resolve_optional(request.presence_penalty, _default_presence_penalty)
+    if presence_penalty is not None:
+        chat_kwargs["presence_penalty"] = presence_penalty
+    frequency_penalty = _resolve_optional(request.frequency_penalty, _default_frequency_penalty)
+    if frequency_penalty is not None:
+        chat_kwargs["frequency_penalty"] = frequency_penalty
+    repetition_penalty = _resolve_optional(request.repetition_penalty, _default_repetition_penalty)
+    if repetition_penalty is not None:
+        chat_kwargs["repetition_penalty"] = repetition_penalty
+
     # Add multimodal content
     if has_media:
         chat_kwargs["images"] = images if images else None
@@ -1462,7 +1492,8 @@ async def create_chat_completion(request: ChatCompletionRequest, raw_request: Re
     if _reasoning_parser and not tool_calls:
         text_to_parse = cleaned_text or output.text
         reasoning_text, cleaned_text = _reasoning_parser.extract_reasoning(
-            text_to_parse
+            text_to_parse,
+            implicit_think=True,
         )
 
     # Process response_format if specified (after reasoning parser cleaned the text)
@@ -1732,59 +1763,6 @@ async def count_anthropic_tokens(request: Request):
     return {"input_tokens": total_tokens}
 
 
-def _emit_content_pieces(
-    pieces: list[tuple[str, str]],
-    current_block_type: str | None,
-    block_index: int,
-) -> tuple[list[str], str | None, int]:
-    """Emit Anthropic SSE events for content pieces from the think router.
-
-    Handles block type transitions (thinking <-> text), emitting
-    content_block_start/stop/delta events as needed.
-
-    Args:
-        pieces: List of (block_type, text) from StreamingThinkRouter
-        current_block_type: Current open block type, or None
-        block_index: Current block index
-
-    Returns:
-        Tuple of (events, updated_block_type, updated_block_index)
-    """
-    events = []
-    for block_type, text in pieces:
-        if block_type != current_block_type:
-            # Close previous block if open
-            if current_block_type is not None:
-                events.append(
-                    f"event: content_block_stop\ndata: "
-                    f"{json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-                )
-                block_index += 1
-            # Start new block
-            current_block_type = block_type
-            content_block = (
-                {"type": block_type, "text": ""}
-                if block_type == "text"
-                else {"type": block_type, "thinking": ""}
-            )
-            events.append(
-                f"event: content_block_start\ndata: "
-                f"{json.dumps({'type': 'content_block_start', 'index': block_index, 'content_block': content_block})}\n\n"
-            )
-        # Emit delta
-        delta_key = "thinking" if block_type == "thinking" else "text"
-        delta_type = "thinking_delta" if block_type == "thinking" else "text_delta"
-        delta_event = {
-            "type": "content_block_delta",
-            "index": block_index,
-            "delta": {"type": delta_type, delta_key: text},
-        }
-        events.append(
-            f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
-        )
-    return events, current_block_type, block_index
-
-
 async def _stream_anthropic_messages(
     engine: BaseEngine,
     openai_request: ChatCompletionRequest,
@@ -1834,87 +1812,48 @@ async def _stream_anthropic_messages(
     }
     yield f"event: message_start\ndata: {json.dumps(message_start)}\n\n"
 
-    # Stream pipeline: raw text → tool call filter → think router → emit
-    # - Tool call filter strips tool call markup (emitted as structured blocks later)
-    # - Think router separates <think> content into Anthropic thinking blocks
-    accumulated_text = ""
-    tool_filter = StreamingToolCallFilter()
-    # Detect if the model's chat template injects <think> into the
-    # generation prompt. If so, the model starts in thinking mode and
-    # the opening tag never appears in the output stream.
-    _tokenizer = engine.tokenizer if hasattr(engine, "tokenizer") else None
-    _chat_template = ""
-    if _tokenizer and hasattr(_tokenizer, "chat_template"):
-        _chat_template = _tokenizer.chat_template or ""
-    _starts_thinking = (
-        "<think>" in _chat_template and "add_generation_prompt" in _chat_template
-    )
-    think_router = StreamingThinkRouter(start_in_thinking=_starts_thinking)
-    prompt_tokens = 0
-    completion_tokens = 0
+    # Emit content_block_start for text
+    content_block_start = {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {"type": "text", "text": ""},
+    }
+    yield f"event: content_block_start\ndata: {json.dumps(content_block_start)}\n\n"
 
-    # Track which content blocks we've started
-    current_block_type = None  # "thinking" or "text"
-    block_index = 0
+    # Stream content deltas
+    accumulated_text = ""
+    completion_tokens = 0
 
     async for output in engine.stream_chat(messages=messages, **chat_kwargs):
         delta_text = output.new_text
 
         # Track token counts
-        if hasattr(output, "prompt_tokens") and output.prompt_tokens:
-            prompt_tokens = output.prompt_tokens
         if hasattr(output, "completion_tokens") and output.completion_tokens:
             completion_tokens = output.completion_tokens
 
         if delta_text:
-            # Accumulate raw text BEFORE special token cleaning for tool parsing
-            accumulated_text += delta_text
-
-            # Filter special tokens for display
+            # Filter special tokens
             content = SPECIAL_TOKENS_PATTERN.sub("", delta_text)
 
             if content:
-                # Stage 1: strip tool call markup
-                filtered = tool_filter.process(content)
-                if not filtered:
-                    continue
-                # Stage 2: route thinking vs text
-                pieces = think_router.process(filtered)
-                events, current_block_type, block_index = _emit_content_pieces(
-                    pieces, current_block_type, block_index
-                )
-                for event in events:
-                    yield event
-
-    # Flush remaining from both filters
-    remaining = tool_filter.flush()
-    if remaining:
-        events, current_block_type, block_index = _emit_content_pieces(
-            think_router.process(remaining), current_block_type, block_index
-        )
-        for event in events:
-            yield event
-
-    flush_pieces = think_router.flush()
-    if flush_pieces:
-        events, current_block_type, block_index = _emit_content_pieces(
-            flush_pieces, current_block_type, block_index
-        )
-        for event in events:
-            yield event
-
-    # Close final content block
-    if current_block_type is not None:
-        yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': block_index})}\n\n"
-        block_index += 1
+                accumulated_text += content
+                delta_event = {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": content},
+                }
+                yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
     # Check for tool calls in accumulated text
     _, tool_calls = _parse_tool_calls_with_parser(accumulated_text, openai_request)
 
+    # Emit content_block_stop for text block
+    yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+
     # If there are tool calls, emit tool_use blocks
     if tool_calls:
         for i, tc in enumerate(tool_calls):
-            tool_index = block_index + i
+            tool_index = i + 1
             try:
                 tool_input = json.loads(tc.function.arguments)
             except (json.JSONDecodeError, AttributeError):
@@ -1952,7 +1891,7 @@ async def _stream_anthropic_messages(
     message_delta = {
         "type": "message_delta",
         "delta": {"stop_reason": stop_reason, "stop_sequence": None},
-        "usage": {"input_tokens": prompt_tokens, "output_tokens": completion_tokens},
+        "usage": {"output_tokens": completion_tokens},
     }
     yield f"event: message_delta\ndata: {json.dumps(message_delta)}\n\n"
 
@@ -1960,7 +1899,7 @@ async def _stream_anthropic_messages(
     elapsed = time.perf_counter() - start_time
     tokens_per_sec = completion_tokens / elapsed if elapsed > 0 else 0
     logger.info(
-        f"Anthropic messages (stream): prompt={prompt_tokens} + completion={completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
+        f"Anthropic messages (stream): {completion_tokens} tokens in {elapsed:.2f}s ({tokens_per_sec:.1f} tok/s)"
     )
 
     # Emit message_stop
@@ -2093,6 +2032,60 @@ async def stream_chat_completion(
             if delta_msg is None:
                 # Skip this chunk (e.g., <think> token itself)
                 continue
+
+            # If reasoning parser produced content (not reasoning), feed it
+            # through the tool parser so <tool_call> tags become structured
+            # tool_calls instead of being emitted as plain text.
+            if tool_parser and delta_msg.content:
+                tool_content = delta_msg.content
+                if not tool_markup_possible and "<" not in tool_content:
+                    tool_accumulated_text += tool_content
+                else:
+                    if not tool_markup_possible:
+                        tool_markup_possible = True
+                    tool_previous = tool_accumulated_text
+                    tool_accumulated_text += tool_content
+                    tool_result = tool_parser.extract_tool_calls_streaming(
+                        tool_previous, tool_accumulated_text, tool_content
+                    )
+
+                    if tool_result is None:
+                        # Inside tool markup — suppress, emit reasoning only
+                        if delta_msg.reasoning:
+                            chunk = ChatCompletionChunk(
+                                id=response_id,
+                                model=_model_name,
+                                choices=[
+                                    ChatCompletionChunkChoice(
+                                        delta=ChatCompletionChunkDelta(
+                                            reasoning=delta_msg.reasoning,
+                                        ),
+                                        finish_reason=None,
+                                    )
+                                ],
+                            )
+                            yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
+
+                    if "tool_calls" in tool_result:
+                        tool_calls_detected = True
+                        chunk = ChatCompletionChunk(
+                            id=response_id,
+                            model=_model_name,
+                            choices=[
+                                ChatCompletionChunkChoice(
+                                    delta=ChatCompletionChunkDelta(
+                                        tool_calls=tool_result["tool_calls"]
+                                    ),
+                                    finish_reason=(
+                                        "tool_calls" if output.finished else None
+                                    ),
+                                )
+                            ],
+                            usage=get_usage(output) if output.finished else None,
+                        )
+                        yield f"data: {chunk.model_dump_json()}\n\n"
+                        continue
 
             chunk = ChatCompletionChunk(
                 id=response_id,
@@ -2397,6 +2390,16 @@ Examples:
         _default_temperature = args.default_temperature
     if args.default_top_p is not None:
         _default_top_p = args.default_top_p
+    if args.default_top_k is not None:
+        _default_top_k = args.default_top_k
+    if args.default_min_p is not None:
+        _default_min_p = args.default_min_p
+    if args.default_presence_penalty is not None:
+        _default_presence_penalty = args.default_presence_penalty
+    if args.default_frequency_penalty is not None:
+        _default_frequency_penalty = args.default_frequency_penalty
+    if args.default_repetition_penalty is not None:
+        _default_repetition_penalty = args.default_repetition_penalty
 
     # Configure rate limiter
     if args.rate_limit > 0:

@@ -158,12 +158,18 @@ class ChatCompletionRequest(BaseModel):
     messages: list[Message]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
     max_tokens: int | None = None
     stream: bool = False
     stream_options: StreamOptions | None = (
         None  # Streaming options (include_usage, etc.)
     )
     stop: list[str] | None = None
+    # Penalty parameters (wired to mlx-lm logits processors)
+    presence_penalty: float | None = None
+    frequency_penalty: float | None = None
+    repetition_penalty: float | None = None
     # Tool calling
     tools: list[ToolDefinition] | None = None
     tool_choice: str | dict | None = None  # "auto", "none", or specific tool
@@ -236,6 +242,8 @@ class CompletionRequest(BaseModel):
     prompt: str | list[str]
     temperature: float | None = None
     top_p: float | None = None
+    top_k: int | None = None
+    min_p: float | None = None
     max_tokens: int | None = None
     stream: bool = False
     stop: list[str] | None = None

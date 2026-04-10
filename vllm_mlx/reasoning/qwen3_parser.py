@@ -43,6 +43,7 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
     def extract_reasoning(
         self,
         model_output: str,
+        implicit_think: bool = False,
     ) -> tuple[str | None, str | None]:
         """
         Extract reasoning from Qwen3 output.
@@ -56,9 +57,11 @@ class Qwen3ReasoningParser(BaseThinkingReasoningParser):
         Returns:
             (reasoning, content) tuple.
         """
-        # If no end token at all, treat as pure content
+        # If no end token at all, decide based on context
         if self.end_token not in model_output:
+            if implicit_think:
+                return model_output.strip() or None, None
             return None, model_output
 
         # Use base class implementation (handles both explicit and implicit)
-        return super().extract_reasoning(model_output)
+        return super().extract_reasoning(model_output, implicit_think=implicit_think)

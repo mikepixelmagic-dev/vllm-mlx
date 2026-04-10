@@ -145,7 +145,7 @@ class NemotronToolParser(ToolParser):
         if "<tool_call>" not in current_text:
             return {"content": delta_text}
 
-        if "</tool_call>" in delta_text:
+        if "</tool_call>" in current_text:
             result = self.extract_tool_calls(current_text)
             if result.tools_called:
                 return {

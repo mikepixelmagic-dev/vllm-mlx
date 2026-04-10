@@ -111,6 +111,8 @@ class MLXLanguageModel:
         self,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        top_k: int = 0,
+        min_p: float = 0.0,
     ):
         """Create a sampler for text generation."""
         from mlx_lm.sample_utils import make_sampler
@@ -118,7 +120,28 @@ class MLXLanguageModel:
         return make_sampler(
             temp=temperature,
             top_p=top_p,
+            top_k=top_k,
+            min_p=min_p,
         )
+
+    def _create_logits_processors(
+        self,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        repetition_penalty: float | None = None,
+    ):
+        """Create logits processors for penalty parameters."""
+        from mlx_lm.sample_utils import make_logits_processors
+
+        processors = make_logits_processors(
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
+        )
+        return processors if processors else None
+
+    # Token ID for </think> — used to detect thinking completion.
+    _think_close_token_id: int | None = None
 
     def generate(
         self,
@@ -126,7 +149,11 @@ class MLXLanguageModel:
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        repetition_penalty: float = 1.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        repetition_penalty: float | None = None,
         stop: list[str] | None = None,
     ) -> GenerationOutput:
         """
@@ -146,29 +173,96 @@ class MLXLanguageModel:
         if not self._loaded:
             self.load()
 
-        from mlx_lm import generate
+        from mlx_lm import stream_generate
+
+        # Resolve </think> token ID once
+        if self._think_close_token_id is None:
+            try:
+                ids = self.tokenizer.encode("</think>", add_special_tokens=False)
+                self._think_close_token_id = ids[0] if len(ids) == 1 else -1
+            except Exception:
+                self._think_close_token_id = -1
 
         # Create sampler with parameters
-        sampler = self._create_sampler(temperature, top_p)
+        sampler = self._create_sampler(temperature, top_p, top_k, min_p)
 
-        # Generate text
-        output_text = generate(
+        # Create logits processors for penalties
+        logits_processors = self._create_logits_processors(
+            presence_penalty=presence_penalty,
+            frequency_penalty=frequency_penalty,
+            repetition_penalty=repetition_penalty,
+        )
+
+        gen_kwargs = {"sampler": sampler}
+        if logits_processors:
+            gen_kwargs["logits_processors"] = logits_processors
+
+        # Determine whether the prompt ends inside a <think> block.
+        prompt_has_think = prompt.rstrip().endswith("<think>")
+        thinking_budget = max_tokens // 2 if prompt_has_think else max_tokens
+
+        accumulated_text = ""
+        tokens: list[int] = []
+        finish_reason: str | None = None
+        think_close_seen = False
+
+        for resp in stream_generate(
             self.model,
             self.tokenizer,
             prompt=prompt,
             max_tokens=max_tokens,
-            sampler=sampler,
-            verbose=False,
-        )
+            **gen_kwargs,
+        ):
+            accumulated_text += resp.text
+            tokens.append(resp.token)
 
-        # Tokenize output to get token IDs
-        tokens = self.tokenizer.encode(output_text)
+            if resp.token == self._think_close_token_id:
+                think_close_seen = True
 
-        # Determine finish reason
-        finish_reason = "length" if len(tokens) >= max_tokens else "stop"
+            if (
+                prompt_has_think
+                and not think_close_seen
+                and len(tokens) >= thinking_budget
+            ):
+                logger.info(
+                    "Thinking budget (%d tokens) exceeded without </think> — "
+                    "force-closing thinking block.",
+                    thinking_budget,
+                )
+                accumulated_text += "</think>\n"
+                finish_reason = "thinking_budget"
+                break
+
+            if resp.finish_reason is not None:
+                finish_reason = resp.finish_reason
+                break
+
+        # If we force-closed thinking, run a second pass for the answer.
+        if finish_reason == "thinking_budget":
+            answer_budget = max_tokens - len(tokens)
+            if answer_budget > 0:
+                answer_prompt = prompt + accumulated_text
+                for resp in stream_generate(
+                    self.model,
+                    self.tokenizer,
+                    prompt=answer_prompt,
+                    max_tokens=answer_budget,
+                    **gen_kwargs,
+                ):
+                    accumulated_text += resp.text
+                    tokens.append(resp.token)
+                    if resp.finish_reason is not None:
+                        finish_reason = resp.finish_reason
+                        break
+
+            if finish_reason == "thinking_budget":
+                finish_reason = "length"
+
+        if finish_reason is None:
+            finish_reason = "length" if len(tokens) >= max_tokens else "stop"
 
         return GenerationOutput(
-            text=output_text,
+            text=accumulated_text,
             tokens=tokens,
             finish_reason=finish_reason,
         )
@@ -179,7 +273,11 @@ class MLXLanguageModel:
         max_tokens: int = 256,
         temperature: float = 0.7,
         top_p: float = 0.9,
-        repetition_penalty: float = 1.0,
+        top_k: int = 0,
+        min_p: float = 0.0,
+        presence_penalty: float | None = None,
+        frequency_penalty: float | None = None,
+        repetition_penalty: float | None = None,
         stop: list[str] | None = None,
     ) -> Iterator[StreamingOutput]:
         """
@@ -279,10 +377,14 @@ class MLXLanguageModel:
 
         # Apply chat template
         if hasattr(self.tokenizer, "apply_chat_template"):
+            # Enable thinking mode for non-coder models
+            enable_thinking = "coder" not in self.model_name.lower()
+
             # Build kwargs for apply_chat_template
             template_kwargs = {
                 "tokenize": False,
                 "add_generation_prompt": True,
+                "enable_thinking": enable_thinking,
             }
 
             # Add tools if provided and supported
@@ -295,8 +397,10 @@ class MLXLanguageModel:
                     **template_kwargs,
                 )
             except TypeError:
-                # Tokenizer doesn't support tools parameter
-                del template_kwargs["tools"]
+                # Some templates don't support all kwargs
+                for key in ["tools", "enable_thinking"]:
+                    if key in template_kwargs:
+                        del template_kwargs[key]
                 prompt = self.tokenizer.apply_chat_template(
                     messages,
                     **template_kwargs,
